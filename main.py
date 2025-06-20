@@ -4,13 +4,18 @@ from dotenv import load_dotenv
 import os
 import re
 from davia import Davia
+from datetime import timedelta
 
 app = Davia()
 
 load_dotenv()
 gemini_api_key = os.getenv("GEMINI_API_KEY")
-
 genai.configure(api_key=gemini_api_key)
+
+
+def format_timestamp(seconds: float) -> str:
+    td = timedelta(seconds=int(seconds))
+    return str(td)[2:] if td < timedelta(hours=1) else str(td)  # Remove leading '0:' for under an hour
 
 
 @app.task
@@ -24,7 +29,7 @@ def extract_video_id(url: str) -> str | None:
 def get_transcript(video_id: str) -> str:
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join([item['text'] for item in transcript])
+        return "\n".join([f"{format_timestamp(item['start'])} - {item['text']}" for item in transcript])
     except (TranscriptsDisabled, NoTranscriptFound):
         return "Transcript is not available for this video."
     except Exception as e:
@@ -40,7 +45,7 @@ def summarize_text(text: str) -> str:
     - A bullet list of Highlights (key takeaways)
     
     Format clearly and keep the language simple.
- 
+
     Transcript:
     {text}
     """
@@ -49,6 +54,7 @@ def summarize_text(text: str) -> str:
         return response.text.strip()
     except Exception as e:
         return f"Error generating summary: {e}"
+
 
 @app.task
 def clean_gemini_output(raw_text: str) -> str:
