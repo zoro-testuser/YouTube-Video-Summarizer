@@ -1,31 +1,33 @@
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-import google.generativeai as genai
-from dotenv import load_dotenv
 import os
 import re
-from davia import Davia
 from datetime import timedelta
-
-app = Davia()
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from dotenv import load_dotenv
+from openai import OpenAI
+import yt_dlp
+from davia import Davia
 
 load_dotenv()
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=gemini_api_key)
+
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY")
+)
+
+app = Davia()
 
 
 def format_timestamp(seconds: float) -> str:
     td = timedelta(seconds=int(seconds))
-    return str(td)[2:] if td < timedelta(hours=1) else str(td)  # Remove leading '0:' for under an hour
+    return str(td)[2:] if td < timedelta(hours=1) else str(td)
 
 
-@app.task
 def extract_video_id(url: str) -> str | None:
     pattern = r"(?:v=|\/)([0-9A-Za-z_-]{11}).*"
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
 
-@app.task
 def get_transcript(video_id: str) -> str:
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
@@ -36,57 +38,92 @@ def get_transcript(video_id: str) -> str:
         return f"Error fetching transcript: {e}"
 
 
-@app.task
-def summarize_text(text: str) -> str:
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    prompt = f"""
-    Summarize the following YouTube video transcript into a well-organized response with:
-    - A clean, beginner-friendly Summary
-    - A bullet list of Highlights (key takeaways)
-    
-    Format clearly and keep the language simple.
-
-    Transcript:
-    {text}
-    """
+def get_video_metadata(url: str) -> tuple[str, str]:
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        ydl_opts = {'quiet': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'No title found')
+            duration = str(timedelta(seconds=info.get('duration', 0)))
+            return title, duration
+    except Exception:
+        return "Unknown Title", "Unknown Duration"
+
+
+def summarize_text_with_openai(text: str) -> str:
+    prompt = f"""
+You are a helpful assistant. Return a:
+1. Beginner-friendly summary.
+2. List of key highlights in bullet points.
+(Plain text, no markdown headers.)
+
+Transcript:
+{text}
+"""
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You summarize YouTube transcripts."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
         return f"Error generating summary: {e}"
 
 
-@app.task
-def clean_gemini_output(raw_text: str) -> str:
-    cleaned = re.sub(r"\*\*(.*?)\*\*", lambda m: m.group(1).upper(), raw_text)
-    cleaned = re.sub(r"^\s*\*\s*", "- ", cleaned, flags=re.MULTILINE)
-    cleaned = re.sub(r"\*", "", cleaned)
-    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+def clean_response_output(raw_text: str) -> tuple[str, list[str]]:
+    raw_text = raw_text.replace("**", "").strip()
+    raw_text = re.sub(r"\bKey\s*\n\s*Highlights\b", "Key Highlights", raw_text, flags=re.IGNORECASE)
+    parts = re.split(r"(?i)key highlights\s*[:\-]?", raw_text)
+    summary_part = parts[0].strip()
+    highlight_text = parts[1].strip() if len(parts) > 1 else ""
+    highlights = re.findall(r"[-•]\s+(.*)", highlight_text)
+    return summary_part, highlights
 
 
 @app.task
-def generate_summary_from_url(youtube_url: str) -> dict:
+def action_summarize_youtube(
+    youtube_url: str
+) -> dict:
+    """
+    Summarize a YouTube video.
+
+    Args:
+      youtube_url: Full URL of the YouTube video.
+
+    Returns:
+      Dict including:
+        - video_url: embed URL for iframe
+        - video_title: Title
+        - video_duration: Duration (HH:MM:SS)
+        - transcript: Full transcript with timestamps
+        - summary: Clean summary paragraph
+        - highlights: List of key bullet points
+    """
     video_id = extract_video_id(youtube_url)
     if not video_id:
         return {"error": "❌ Invalid YouTube URL."}
 
     transcript = get_transcript(video_id)
-    if "Transcript is not available" in transcript or "Error" in transcript:
+    if "Transcript is not available" in transcript or transcript.startswith("Error"):
         return {"error": transcript}
 
-    summary_text = summarize_text(transcript)
+    summary_text = summarize_text_with_openai(transcript)
     if summary_text.startswith("Error"):
         return {"error": summary_text}
 
-    cleaned = clean_gemini_output(summary_text)
-
-    highlights = re.findall(r"^- (.+)", cleaned, re.MULTILINE)
-    summary_only = re.sub(r"^- .+\n?", "", cleaned, flags=re.MULTILINE).strip()
+    summary, highlights = clean_response_output(summary_text)
+    title, duration = get_video_metadata(youtube_url)
 
     return {
         "video_url": f"https://www.youtube.com/embed/{video_id}",
+        "video_title": title,
+        "video_duration": duration,
         "transcript": transcript,
-        "summary": summary_only,
+        "summary": summary,
         "highlights": highlights
     }
 
